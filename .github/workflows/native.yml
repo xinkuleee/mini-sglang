@@ -1,0 +1,22 @@
+name: cpp
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build-core -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build-core --config Release --parallel 2
+      - run: ctest --test-dir build-core -C Release --output-on-failure
+  model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMINISGL_WITH_LLAMA=ON
+      - run: cmake --build build --parallel 2
+      - run: curl -fL https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf -o /tmp/tiny.gguf
+      - run: echo '270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d  /tmp/tiny.gguf' | sha256sum --check
+      - run: python tests/conformance.py --binary build/mini-sglang --model /tmp/tiny.gguf
