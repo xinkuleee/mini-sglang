@@ -1,0 +1,25 @@
+[package]
+name = "mini-sglang"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A small native inference scheduler inspired by mini-sglang"
+
+[features]
+default = []
+llama = []
+
+[dependencies]
+serde_json = "=1.0.145"
+
+[lib]
+name = "mini_sglang"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mini-sglang"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
