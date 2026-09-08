@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace minisgl {
 
@@ -54,7 +55,7 @@ void PrefixCache::refresh_ancestors(Node *node) {
     }
 }
 
-PrefixCache::Node *PrefixCache::find_exact(const std::vector<Token> &tokens) const {
+PrefixCache::Node *PrefixCache::find_exact(std::span<const Token> tokens) const {
     Node *node = root_.get();
     std::size_t offset = 0;
     while (offset < tokens.size()) {
@@ -73,7 +74,7 @@ PrefixCache::Node *PrefixCache::find_exact(const std::vector<Token> &tokens) con
     return node;
 }
 
-std::optional<PrefixMatch> PrefixCache::find(const std::vector<Token> &tokens,
+std::optional<PrefixMatch> PrefixCache::find(std::span<const Token> tokens,
                                              std::size_t max_tokens) {
     const auto limit = std::min(tokens.size(), max_tokens);
     Node *node = root_.get();
@@ -104,8 +105,7 @@ std::optional<PrefixMatch> PrefixCache::find(const std::vector<Token> &tokens,
     return PrefixMatch{*source->sequence, matched};
 }
 
-std::optional<SequenceId> PrefixCache::insert(const std::vector<Token> &tokens,
-                                              SequenceId sequence) {
+std::optional<SequenceId> PrefixCache::insert(std::span<const Token> tokens, SequenceId sequence) {
     if (tokens.empty() || sequence < 0) {
         throw std::invalid_argument(
             "prefix cache requires a nonempty prompt and nonnegative sequence");

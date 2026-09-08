@@ -6,8 +6,8 @@
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
-#include <vector>
 
 namespace minisgl {
 
@@ -31,12 +31,13 @@ class PrefixCache {
 
     // 返回最长公共前缀；命中会刷新提供 KV 的完整 prompt 的 LRU。
     // caller 通常传 prompt.size() - 1，保留最后一个 token 来重算 logits。
-    std::optional<PrefixMatch> find(const std::vector<Token> &tokens, std::size_t max_tokens);
+    std::optional<PrefixMatch> find(std::span<const Token> tokens, std::size_t max_tokens);
 
     // 只插入 KV 已经完整计算的 prompt。相同 prompt 替换时返回旧 sequence，
     // 由 caller 释放；同一 sequence 不允许对应不同 prompt。
     // 空 prompt、负 sequence 或 sequence 被不同 prompt 占用时抛 invalid_argument。
-    std::optional<SequenceId> insert(const std::vector<Token> &tokens, SequenceId sequence);
+    // 输入只在调用期间借用；树持有所需 token 的副本，不保留 span。
+    std::optional<SequenceId> insert(std::span<const Token> tokens, SequenceId sequence);
     std::optional<SequenceId> evict_lru();
     bool erase_sequence(SequenceId sequence);
     // 仅清空索引，不回收后端 KV；失败清理时 caller 已逐一释放 sequence。
@@ -59,7 +60,7 @@ class PrefixCache {
     std::size_t nodes_ = 1;
     std::size_t tokens_ = 0;
 
-    Node *find_exact(const std::vector<Token> &tokens) const;
+    Node *find_exact(std::span<const Token> tokens) const;
     void touch(Node &node);
     void refresh(Node &node);
     void refresh_ancestors(Node *node);

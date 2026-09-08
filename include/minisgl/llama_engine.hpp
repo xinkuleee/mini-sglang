@@ -27,12 +27,11 @@ class LlamaEngine final : public Engine {
     std::vector<Token> tokenize(const std::string &text) override;
     std::string piece(Token token) override;
     bool is_eog(Token token) const override;
-    std::vector<std::vector<float>> forward(const std::vector<BatchToken> &batch) override;
+    std::vector<std::vector<float>> forward(std::span<const BatchToken> batch) override;
     void copy_sequence(SequenceId src, SequenceId dst, std::size_t end_exclusive) override;
     void remove_sequence(SequenceId id) override;
-    std::string
-    apply_chat_template(const std::vector<std::pair<std::string, std::string>> &messages,
-                        bool add_generation_prompt = true) const;
+    std::string apply_chat_template(std::span<const std::pair<std::string, std::string>> messages,
+                                    bool add_generation_prompt = true) const;
 
   private:
     msgl_handle *handle_ = nullptr;

@@ -8,9 +8,12 @@ import argparse
 import concurrent.futures
 import http.client
 import json
+import os
 import pathlib
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -26,8 +29,13 @@ def main():
     parser.add_argument("--chat", action="store_true", help="require a working GGUF chat template")
     parser.add_argument("--expect-no-chat", action="store_true")
     parser.add_argument("--require-cancel", action="store_true", help="require observed HTTP cancellation (use a nontrivial model)")
+    parser.add_argument("--check-shutdown", action="store_true",
+        help="check C++ startup failure cleanup and POSIX SIGTERM shutdown (requires --binary)")
     args = parser.parse_args()
+    if args.check_shutdown and not args.binary:
+        parser.error("--check-shutdown requires --binary")
     process = None
+    command = None
     log = tempfile.TemporaryFile(mode="w+b")
     if args.binary:
         if not args.model:
@@ -36,11 +44,11 @@ def main():
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
         args.url = f"http://127.0.0.1:{port}"
-        process = subprocess.Popen([str(pathlib.Path(args.binary).resolve()), "--model",
+        command = [str(pathlib.Path(args.binary).resolve()), "--model",
             str(pathlib.Path(args.model).resolve()), "--serve", "--port", str(port),
             "--context-size", "4096", "--batch-tokens", "64",
-            "--prefill-chunk", "16", "--max-sequences", "4", "--cache-sequences", "4"],
-            stdout=log, stderr=log)
+            "--prefill-chunk", "16", "--max-sequences", "4", "--cache-sequences", "4"]
+        process = subprocess.Popen(command, stdout=log, stderr=log)
 
     def call(body=None, endpoint="/v1/completions"):
         data = None if body is None else json.dumps(body).encode()
@@ -78,7 +86,7 @@ def main():
         assert (done, endings) == (1, 1), (done, endings)
         return text, usage
 
-    try:
+    def wait_healthy():
         deadline = time.monotonic() + 120
         while True:
             try:
@@ -94,6 +102,8 @@ def main():
             time.sleep(0.1)
         assert health["status"] == "ok", health
 
+    try:
+        wait_healthy()
         nonce = time.time_ns()
         body = {"prompt": f"A small story about a friendly cloud {nonce}:",
                 "max_tokens": 8, "temperature": 0, "seed": 123}
@@ -169,17 +179,90 @@ def main():
         observed_cancel = stats["total_cancelled"] > before_disconnect["total_cancelled"]
         if args.require_cancel:
             assert observed_cancel, ("request finished before cancellation could be observed", before_disconnect, stats)
-        print(json.dumps({"status": "passed", "observed_cancel": observed_cancel, "cold_prefill_tokens": cold["usage"]["prefill_tokens"],
+        result = {"status": "passed", "observed_cancel": observed_cancel, "cold_prefill_tokens": cold["usage"]["prefill_tokens"],
             "warm_prefill_tokens": warm["usage"]["prefill_tokens"],
-            "cached_tokens": warm["usage"]["cached_tokens"], "final_stats": stats}))
+            "cached_tokens": warm["usage"]["cached_tokens"], "final_stats": stats}
+        if args.check_shutdown:
+            # Both Owner and watcher have started when bind fails. Scope unwinding must
+            # wake and join their idle waits, then let main report its ordinary error.
+            # Windows SO_REUSEADDR may allow two httplib servers to bind the same port.
+            # An independent exclusive listener makes bind failure deterministic.
+            with socket.socket() as blocker:
+                if os.name == "nt":
+                    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                blocker.bind(("127.0.0.1", 0))
+                blocker.listen(1)
+                conflict_command = list(command)
+                conflict_command[conflict_command.index("--port") + 1] = str(blocker.getsockname()[1])
+                conflict = subprocess.run(conflict_command, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, timeout=120, check=False)
+            conflict_log = conflict.stdout.decode("utf-8", errors="replace")
+            assert conflict.returncode == 1 and "cannot bind HTTP server" in conflict_log, (
+                "port conflict must exit cleanly through main's error handler",
+                conflict.returncode, conflict_log)
+            shutdown = {"port_bind_failure": "passed"}
+            if os.name == "nt":
+                # Popen.terminate uses TerminateProcess on Windows; a successful kill
+                # provides no evidence that C++ signal handlers or destructors ran.
+                shutdown["graceful_signal_shutdown"] = "skipped (Windows has no POSIX SIGTERM)"
+                shutdown["stream_signal_shutdown"] = "skipped (Windows has no POSIX SIGTERM)"
+            else:
+                assert process.poll() is None, "server exited before shutdown check"
+                process.send_signal(signal.SIGTERM)
+                assert process.wait(timeout=30) == 0, "SIGTERM must return normally from run_server"
+                shutdown["graceful_signal_shutdown"] = "passed"
+                process = subprocess.Popen(command, stdout=log, stderr=log)
+                wait_healthy()
+                connection = http.client.HTTPConnection(url.hostname, url.port, timeout=30)
+                response = None
+                try:
+                    # Enough prefill work to usually catch an active request, without
+                    # making correctness depend on this particular model's speed/EOS.
+                    connection.request("POST", "/v1/completions", json.dumps({
+                        "prompt": "A cloud travels across the sky. " * 64,
+                        "max_tokens": 1024, "stream": True}), {"Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    assert response.status == 200, response.read()
+                    status, before_stop = call(endpoint="/health")
+                    assert status == 200, before_stop
+                    snapshot = before_stop["stats"]
+                    shutdown["observed_active_before_signal"] = (
+                        snapshot["active_requests"] + snapshot["queued_requests"] > 0)
+                    assert process.poll() is None, "server exited before streaming shutdown"
+                    process.send_signal(signal.SIGTERM)
+                    # Consume concurrently so socket backpressure cannot prevent HTTP
+                    # pool shutdown. Process timeout bounds the complete close path.
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                        reading = pool.submit(response.read)
+                        try:
+                            assert process.wait(timeout=30) == 0, "streaming SIGTERM must exit normally"
+                            try:
+                                data = reading.result(timeout=5)
+                                assert b"data: [DONE]" in data, data
+                            except (ConnectionError, http.client.IncompleteRead):
+                                # httplib may close the stream at its shutdown boundary.
+                                pass
+                        finally:
+                            if process.poll() is None:
+                                process.kill()
+                                process.wait(timeout=10)
+                    shutdown["stream_signal_shutdown"] = "passed"
+                finally:
+                    if response is not None:
+                        response.close()
+                    connection.close()
+            result["shutdown_checks"] = shutdown
+        print(json.dumps(result))
     except Exception:
         if process:
             log.flush()
             log.seek(0)
-            print(log.read().decode("utf-8", errors="replace"))
+            diagnostic = log.read().decode("utf-8", errors="replace")
+            encoding = sys.stdout.encoding or "utf-8"
+            print(diagnostic.encode(encoding, errors="backslashreplace").decode(encoding))
         raise
     finally:
-        if process:
+        if process and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)

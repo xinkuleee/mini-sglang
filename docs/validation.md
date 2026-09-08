@@ -30,7 +30,7 @@ python tests/conformance.py --cpp CPP_BINARY --rust RUST_BINARY --model .models/
 
 | 检查 | 结果 |
 |---|---|
-| 核心调度、缓存、采样语义 | 10 组核心语义测试通过；包含 3,000 次固定种子 radix oracle，CTest 1/1 |
+| 核心调度、缓存、采样语义 | 11 组核心语义测试通过；包含 3,000 次固定种子 radix oracle，CTest 1/1 |
 | 真实 GGUF C ABI 前向、KV 复制/回收 | 通过；tiny Llama 与 SmolLM2，复制源释放后前缀仍可用，与完整 replay logits 一致 |
 | CLI 模型、batch、chunk、prefix 一致性 | 通过；两语言 greedy token IDs 一致，chunk 1/7/64、完整/部分命中、淘汰重算、零输出均通过 |
 | HTTP / chat / SSE / 错误请求 | 通过；真实 SmolLM2 模板、流与非流输出一致、6 并发、未知字段/非法参数/缺少模板拒绝 |
@@ -47,4 +47,14 @@ python tests/conformance.py --cpp CPP_BINARY --rust RUST_BINARY --model .models/
 ```bash
 python tests/server_smoke.py --binary PATH_TO_MINI_SGLANG --model /path/SmolLM2-135M-Instruct-Q4_K_M.gguf --chat --require-cancel
 python tests/server_smoke.py --binary PATH_TO_MINI_SGLANG --model .models/stories260K.gguf --expect-no-chat
+```
+
+## C++20 升级回归
+
+主运行时、公共 C++ 接口和 CLI 实际使用 -std=c++20；native bridge 与固定 llama.cpp 仍使用 -std=c++17。新增数组/subspan 测试验证输入边界、缓存复制后的生命周期；完整 CMake/CTest 与真实 GGUF 跨语言 conformance 通过。SmolLM2 chat/SSE、并发和实际断连取消再次通过。
+
+线程退出回归使用独立占用端口触发 bind 失败，确认已启动的两个 jthread 通过栈展开停止并回收，程序正常返回错误码 1。不能用两个启用端口复用的 HTTP 服务来假定 bind 必然失败。Windows 已执行该回归；POSIX 空闲和流式请求期间 SIGTERM 正常退出检查已接入 Linux CI，本地 Windows 明确跳过，不能将 TerminateProcess 当作析构成功证据。
+
+```bash
+python tests/server_smoke.py --binary build/mini-sglang --model .models/stories260K.gguf --expect-no-chat --check-shutdown
 ```

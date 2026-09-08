@@ -8,7 +8,7 @@
 #include "minisgl/types.hpp"
 
 #include <random>
-#include <vector>
+#include <span>
 
 namespace minisgl {
 
@@ -18,7 +18,8 @@ void validate_sampling(const SamplingParams &params);
 // temperature == 0 时返回分数最大的 token，平局选最小 id，且不消耗 rng。
 // top_k == 0 表示不过滤；top-p 在 top-k 后的归一化分布上保留最小概率前缀。
 // 空 logits 或没有可选 token 时抛出 std::invalid_argument。
-Token sample_token(const std::vector<float> &logits, const SamplingParams &params,
+// logits 只在调用期间借用；既可以传 vector，也可以传数组或其中一段。
+Token sample_token(std::span<const float> logits, const SamplingParams &params,
                    std::mt19937_64 &rng);
 
 } // namespace minisgl

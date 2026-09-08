@@ -18,6 +18,7 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
+#include <stop_token>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -58,6 +59,23 @@ using nlohmann::json;
 using namespace std::chrono_literals;
 volatile std::sig_atomic_t interrupted = 0;
 void on_signal(int) { interrupted = 1; }
+class SignalHandlers {
+public:
+    SignalHandlers() {
+        interrupted = 0;
+        old_int_ = std::signal(SIGINT, on_signal);
+        old_term_ = std::signal(SIGTERM, on_signal);
+    }
+    ~SignalHandlers() {
+        if (old_int_ != SIG_ERR) std::signal(SIGINT, old_int_);
+        if (old_term_ != SIG_ERR) std::signal(SIGTERM, old_term_);
+    }
+    SignalHandlers(const SignalHandlers&) = delete;
+    SignalHandlers& operator=(const SignalHandlers&) = delete;
+private:
+    using Handler = void (*)(int);
+    Handler old_int_, old_term_;
+};
 constexpr std::size_t max_pending = 64, max_events = 256;
 json error_json(const std::string& message, const std::string& type) {
     return {{"error", {{"message", message}, {"type", type}}}};
@@ -154,10 +172,16 @@ json usage_json(const Event& event) {
 class Owner {
 public:
     Owner(LlamaEngine& engine, const SchedulerConfig& config)
-        : engine_(engine), config_(config), worker_([this] { run(); }) {}
+        : engine_(engine), config_(config), worker_([this](std::stop_token stop) { run(stop); }) {}
     ~Owner() { stop(); }
+    void request_stop() {
+        { std::lock_guard<std::mutex> lock(mutex_); stopped_ = true; }
+        // stop-aware wait 会被 request_stop 唤醒，无须轮询或另配一套停止通知。
+        worker_.request_stop();
+    }
     void stop() {
-        stopped_ = true; wake_.notify_all();
+        request_stop();
+        // 只有 run_server 所在线程 join；watcher 只请求停止，避免并发 join。
         if (worker_.joinable()) worker_.join();
     }
     bool enqueue(const std::shared_ptr<Channel>& channel) {
@@ -174,21 +198,39 @@ private:
         channel->rejection = status; channel->rejection_message = message;
         channel->acknowledged = true; channel->ready.notify_all();
     }
-    void run() {
+    static void finish_error(const std::shared_ptr<Channel>& channel, const std::string& message) {
+        Event end; end.request_id = channel->request.id;
+        end.finish_reason = "error"; end.error = message;
+        std::lock_guard<std::mutex> lock(channel->mutex);
+        channel->rejection = 503; channel->rejection_message = message;
+        channel->acknowledged = true;
+        // 关闭也服从队列上界，并立即交付终止事件，不再排在未消费 token 后面。
+        channel->events.clear(); channel->events.push_back(std::move(end));
+        channel->ready.notify_all();
+    }
+    void run(std::stop_token stop) {
         // Scheduler 在 owner 内构造、销毁：所有 sequence 清理也留在同一个线程。
         std::map<RequestId, std::shared_ptr<Channel>> active;
         std::deque<std::shared_ptr<Channel>> additions;
+        const auto fail = [&](const std::string& message) {
+            std::cerr << "model owner failed: " << message << '\n';
+            for (const auto& channel : additions) reject(channel, 503, message);
+            for (const auto& [id, channel] : active) finish_error(channel, message);
+            std::lock_guard<std::mutex> lock(mutex_); stats_.healthy = false;
+        };
         try {
             Scheduler scheduler(engine_, config_);
-            while (!stopped_) {
+            while (!stop.stop_requested()) {
                 additions.clear();
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
-                    if (scheduler.idle() && incoming_.empty())
-                        wake_.wait_for(lock, 100ms, [&] { return stopped_ || !incoming_.empty(); });
+                    if (scheduler.idle())
+                        wake_.wait(lock, stop, [&] { return !incoming_.empty(); });
+                    if (stop.stop_requested()) break;
                     additions.swap(incoming_);
                 }
                 for (const auto& channel : additions) {
+                    if (stop.stop_requested()) { reject(channel, 503, "server is stopping"); continue; }
                     if (channel->cancelled) { reject(channel, 499, "client disconnected"); continue; }
                     try {
                         if (channel->chat) {
@@ -202,9 +244,11 @@ private:
                     } catch (const std::invalid_argument& error) { reject(channel, 400, error.what()); }
                       catch (const std::exception& error) { reject(channel, 503, error.what()); }
                 }
+                if (stop.stop_requested()) break;
                 for (const auto& [id, channel] : active)
                     if (channel->cancelled) scheduler.cancel(id);
                 if (!scheduler.idle()) {
+                    // 停止是协作式的：已经开始的同步 forward 必须返回后才能清理 KV。
                     auto events = scheduler.step();
                     // 先发布本轮统计，再唤醒完成请求：随后 /health 不会看到上一轮快照。
                     { std::lock_guard<std::mutex> lock(mutex_); stats_ = scheduler.stats(); }
@@ -232,38 +276,30 @@ private:
             }
             for (auto& [id, channel] : active) {
                 scheduler.cancel(id);
-                reject(channel, 503, "server is stopping");
-                std::lock_guard<std::mutex> lock(channel->mutex);
-                Event end; end.request_id = id; end.finish_reason = "error"; end.error = "server is stopping";
-                channel->events.push_back(end); channel->ready.notify_all();
+                finish_error(channel, "server is stopping");
             }
+            // 所有 live request 已标记 cancel；step 只回收，不再发起模型前向。
             while (!scheduler.idle()) scheduler.step();
         } catch (const std::exception& error) {
-            std::cerr << "model owner failed: " << error.what() << '\n';
             // 即使 scheduler 抛出非预期异常，所有等 ack/终止事件的 HTTP 线程也必须醒来。
-            for (const auto& channel : additions)
-                reject(channel, 503, error.what());
-            for (const auto& [id, channel] : active) {
-                reject(channel, 503, error.what());
-                std::lock_guard<std::mutex> lock(channel->mutex);
-                Event end; end.request_id = id; end.finish_reason = "error"; end.error = error.what();
-                channel->events.clear(); channel->events.push_back(std::move(end));
-                channel->ready.notify_all();
-            }
-            std::lock_guard<std::mutex> lock(mutex_); stats_.healthy = false; stopped_ = true;
+            fail(error.what());
+        } catch (...) {
+            fail("unknown model owner failure");
         }
         std::lock_guard<std::mutex> lock(mutex_);
+        stopped_ = true;
         for (const auto& channel : incoming_) reject(channel, 503, "server is stopping");
         incoming_.clear();
     }
     LlamaEngine& engine_;
     SchedulerConfig config_;
     std::mutex mutex_;
-    std::condition_variable wake_;
+    std::condition_variable_any wake_;
     std::deque<std::shared_ptr<Channel>> incoming_;
     SchedulerStats stats_;
-    std::atomic<bool> stopped_{false};
-    std::thread worker_;
+    bool stopped_ = false; // mutex_ 保护入口是否仍接受请求。
+    // 最后构造、最先析构，join 完成前以上状态与 engine_ 引用都保持有效。
+    std::jthread worker_;
 };
 
 bool acknowledge(const httplib::Request& request, const std::shared_ptr<Channel>& channel) {
@@ -362,9 +398,7 @@ void streaming_response(httplib::Response& response, const std::shared_ptr<Chann
 } // namespace
 
 int run_server(LlamaEngine& engine, const SchedulerConfig& scheduler, const ServerConfig& config) {
-    interrupted = 0;
-    const auto old_int = std::signal(SIGINT, on_signal);
-    const auto old_term = std::signal(SIGTERM, on_signal);
+    SignalHandlers signals;
     Owner owner(engine, scheduler);
     httplib::Server server;
     server.new_task_queue = [] { return new httplib::ThreadPool(8, 32); };
@@ -405,20 +439,28 @@ int run_server(LlamaEngine& engine, const SchedulerConfig& scheduler, const Serv
     };
     server.Post("/v1/completions", handler(false));
     server.Post("/v1/chat/completions", handler(true));
+    // 等待设施先在调用线程构造；watcher 启动异常时仍能正常析构 Owner。
+    std::mutex signal_mutex;
+    std::condition_variable_any signal_wake;
+    std::jthread signal_watcher([&](std::stop_token stop) {
+        std::unique_lock<std::mutex> lock(signal_mutex);
+        while (!stop.stop_requested()) {
+            if (interrupted) {
+                owner.request_stop();
+                // bind 后、listen 前到达的信号不能丢：httplib 此时 stop 尚无效。
+                if (server.is_running()) { server.stop(); return; }
+            }
+            // 信号处理器仅设置 sig_atomic_t；普通线程负责停止和 HTTP 操作。
+            signal_wake.wait_for(lock, stop, 50ms, [] { return false; });
+        }
+    });
     if (!server.bind_to_port(config.host, config.port)) {
-        std::signal(SIGINT, old_int); std::signal(SIGTERM, old_term);
         throw std::runtime_error("cannot bind HTTP server to " + config.host + ":" + std::to_string(config.port));
     }
     std::cerr << "mini-sglang listening on http://" << config.host << ':' << config.port << '\n';
-    std::atomic<bool> listening{true};
-    std::thread signal_watcher([&] {
-        while (listening && !interrupted) std::this_thread::sleep_for(50ms);
-        if (interrupted) { owner.stop(); server.stop(); }
-    });
     const bool ok = server.listen_after_bind();
-    listening = false; signal_watcher.join();
+    signal_watcher.request_stop(); signal_watcher.join();
     owner.stop();
-    std::signal(SIGINT, old_int); std::signal(SIGTERM, old_term);
     return ok ? 0 : 1;
 }
 } // namespace minisgl

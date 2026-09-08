@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace minisgl {
 namespace {
@@ -36,7 +37,7 @@ void validate_sampling(const SamplingParams &params) {
     }
 }
 
-Token sample_token(const std::vector<float> &logits, const SamplingParams &params,
+Token sample_token(std::span<const float> logits, const SamplingParams &params,
                    std::mt19937_64 &rng) {
     validate_sampling(params);
     if (logits.empty()) {

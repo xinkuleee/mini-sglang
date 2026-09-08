@@ -3,6 +3,7 @@
 #include "minisgl/scheduler.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -64,9 +65,9 @@ class FakeEngine final : public Engine {
         return std::string(1, static_cast<char>(token));
     }
     bool is_eog(Token token) const override { return token == 0; }
-    std::vector<std::vector<float>> forward(const std::vector<BatchToken> &batch) override {
+    std::vector<std::vector<float>> forward(std::span<const BatchToken> batch) override {
         check(!batch.empty(), "empty backend batch");
-        batches.push_back(batch);
+        batches.emplace_back(batch.begin(), batch.end());
         std::vector<std::vector<float>> output;
         for (const auto &item : batch) {
             auto &sequence = sequences[item.sequence];
@@ -160,19 +161,52 @@ std::string output(const std::vector<Event> &events, const std::string &id) {
     return text;
 }
 
+void borrowed_span_inputs() {
+    // Subviews exclude adjacent storage; inserted cache tokens and recorded batches own copies.
+    SamplingParams options;
+    std::mt19937_64 rng(9);
+    const std::array scores{100.0f, 0.0f, 3.0f, 1.0f, 100.0f};
+    check(sample_token(std::span{scores}.subspan(1, 3), options, rng) == 1,
+          "sampling read outside the logits view");
+
+    PrefixCache cache;
+    {
+        std::array<Token, 5> prompt{99, 1, 2, 3, 88};
+        cache.insert(std::span{prompt}.subspan(1, 3), 7);
+        prompt.fill(0);
+    }
+    const std::array<Token, 3> query{1, 2, 4};
+    const auto match = cache.find(query, query.size());
+    check(match && match->sequence == 7 && match->matched_tokens == 2,
+          "cache retained a borrowed view instead of copying its tokens");
+    cache.assert_invariants();
+
+    FakeEngine engine;
+    {
+        std::array<BatchToken, 4> batch{
+            {{-1, 99, -1, true}, {65, 0, 0, false}, {66, 1, 0, true}, {-1, 99, -1, true}}};
+        const auto logits = engine.forward(std::span{batch}.subspan(1, 2));
+        check(logits.size() == 1, "batch view changed requested logits rows");
+        batch[1].token = 0;
+    }
+    check(engine.sequences.at(0) == std::vector<Token>({65, 66}) &&
+              engine.batches.front().size() == 2 && engine.batches.front()[0].token == 65,
+          "backend retained a borrowed batch or read outside its view");
+}
+
 void sampling_semantics() {
     SamplingParams options;
     std::mt19937_64 rng(123);
     auto same_rng = rng;
-    check(sample_token({2.0f, 2.0f, -1.0f}, options, rng) == 0, "greedy tie");
+    check(sample_token(std::array{2.0f, 2.0f, -1.0f}, options, rng) == 0, "greedy tie");
     check(rng() == same_rng(), "greedy consumed randomness");
     const auto inf = std::numeric_limits<float>::infinity();
     const auto nan = std::numeric_limits<float>::quiet_NaN();
     throws([&] { sample_token({}, options, rng); });
-    throws([&] { sample_token({-inf, -inf}, options, rng); });
-    throws([&] { sample_token({nan, 1.0f}, options, rng); });
-    throws([&] { sample_token({inf, 1.0f}, options, rng); });
-    check(sample_token({-inf, -3.0f}, options, rng) == 1, "negative infinity masking");
+    throws([&] { sample_token(std::array{-inf, -inf}, options, rng); });
+    throws([&] { sample_token(std::array{nan, 1.0f}, options, rng); });
+    throws([&] { sample_token(std::array{inf, 1.0f}, options, rng); });
+    check(sample_token(std::array{-inf, -3.0f}, options, rng) == 1, "negative infinity masking");
     options.temperature = -1;
     throws([&] { validate_sampling(options); });
     options.temperature = inf;
@@ -185,46 +219,49 @@ void sampling_semantics() {
     options.top_p = 1;
     options.top_k = 1;
     for (int i = 0; i < 100; ++i)
-        check(sample_token({0.0f, 3.0f, 2.0f}, options, rng) == 1, "top-k filter");
+        check(sample_token(std::array{0.0f, 3.0f, 2.0f}, options, rng) == 1, "top-k filter");
     options.top_k = 0;
     options.top_p = 0.1f;
     for (int i = 0; i < 100; ++i)
-        check(sample_token({0.0f, 3.0f, 2.0f}, options, rng) == 1, "top-p minimal prefix");
+        check(sample_token(std::array{0.0f, 3.0f, 2.0f}, options, rng) == 1,
+              "top-p minimal prefix");
     options.top_p = 1;
     options.temperature = std::numeric_limits<float>::min();
-    check(sample_token({0.0f, 3.0f, 2.0f}, options, rng) == 1, "small temperature stability");
+    check(sample_token(std::array{0.0f, 3.0f, 2.0f}, options, rng) == 1,
+          "small temperature stability");
     options.temperature = 1;
     std::mt19937_64 first(7), second(7), unrelated(8);
     for (int i = 0; i < 1000; ++i) {
-        const auto token = sample_token({0.0f, 1.0f, 2.0f}, options, first);
-        sample_token({2.0f, 1.0f, 0.0f}, options, unrelated);
-        check(token == sample_token({0.0f, 1.0f, 2.0f}, options, second), "request RNG isolation");
+        const auto token = sample_token(std::array{0.0f, 1.0f, 2.0f}, options, first);
+        sample_token(std::array{2.0f, 1.0f, 0.0f}, options, unrelated);
+        check(token == sample_token(std::array{0.0f, 1.0f, 2.0f}, options, second),
+              "request RNG isolation");
     }
 }
 
 void radix_split_eviction() {
     PrefixCache cache;
-    cache.insert({1, 2, 3}, 10);
-    cache.insert({1, 2, 4}, 11);
+    cache.insert(std::array{1, 2, 3}, 10);
+    cache.insert(std::array{1, 2, 4}, 11);
     check(cache.size() == 2 && cache.token_count() == 4 && cache.node_count() == 4,
           "radix split does not share compressed prefix");
-    auto match = cache.find({1, 2, 3, 5}, 4);
+    auto match = cache.find(std::array{1, 2, 3, 5}, 4);
     check(match && match->matched_tokens == 3 && match->sequence == 10, "longest prefix");
-    match = cache.find({1, 2, 3}, 2);
+    match = cache.find(std::array{1, 2, 3}, 2);
     check(match && match->matched_tokens == 2, "match length limit");
-    cache.insert({1}, 12);
+    cache.insert(std::array{1}, 12);
     cache.assert_invariants();
     check(cache.token_count() == 4, "shorter terminal should not duplicate tokens");
-    throws([&] { cache.insert({8}, 12); });
+    throws([&] { cache.insert(std::array{8}, 12); });
     throws([&] { cache.insert({}, 13); });
-    throws([&] { cache.insert({8}, -1); });
-    check(!cache.find({9}, 5), "unrelated prefixes matched");
-    auto old = cache.insert({1, 2, 4}, 13);
+    throws([&] { cache.insert(std::array{8}, -1); });
+    check(!cache.find(std::array{9}, 5), "unrelated prefixes matched");
+    auto old = cache.insert(std::array{1, 2, 4}, 13);
     check(old && *old == 11, "replacement did not return old owner");
     check(cache.erase_sequence(12), "erase shorter terminal");
     check(!cache.erase_sequence(12), "double erase");
     cache.assert_invariants();
-    cache.find({1, 2, 3}, 3);
+    cache.find(std::array{1, 2, 3}, 3);
     check(cache.evict_lru() == std::optional<SequenceId>(13), "LRU refresh");
     check(cache.node_count() == 2 && cache.token_count() == 3, "unary path not recompressed");
     cache.assert_invariants();
@@ -612,6 +649,7 @@ void cache_pressure_and_same_batch_finish() {
 
 int main() {
     const std::vector<std::pair<const char *, std::function<void()>>> tests = {
+        {"borrowed span inputs and owned results", borrowed_span_inputs},
         {"sampling semantics", sampling_semantics},
         {"compressed radix split and LRU", radix_split_eviction},
         {"compressed radix randomized oracle (3000 operations)", radix_randomized_oracle},

@@ -64,7 +64,7 @@ bool LlamaEngine::is_eog(Token value) const {
     checked(status);
     return status != 0;
 }
-std::vector<std::vector<float>> LlamaEngine::forward(const std::vector<BatchToken> &batch) {
+std::vector<std::vector<float>> LlamaEngine::forward(std::span<const BatchToken> batch) {
     std::vector<msgl_batch_token> native;
     native.reserve(batch.size());
     std::size_t rows = 0;
@@ -88,7 +88,7 @@ void LlamaEngine::copy_sequence(SequenceId src, SequenceId dst, std::size_t end)
 }
 void LlamaEngine::remove_sequence(SequenceId seq) { checked(msgl_remove_seq(handle_, seq)); }
 std::string
-LlamaEngine::apply_chat_template(const std::vector<std::pair<std::string, std::string>> &messages,
+LlamaEngine::apply_chat_template(std::span<const std::pair<std::string, std::string>> messages,
                                  bool add_generation_prompt) const {
     std::vector<msgl_chat_message> native;
     native.reserve(messages.size());

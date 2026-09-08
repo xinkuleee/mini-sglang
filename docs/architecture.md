@@ -17,6 +17,14 @@
 
 `Scheduler` 借用 `Engine&`，所以后端必须活得更久；CLI 的构造顺序满足这一点。调度器内部用 `list<unique_ptr<Active>>` 保持活动请求地址稳定，batch 计划中的指针不会因另一个请求完成而失效。调度器和 `LlamaEngine` 禁止复制，防止重复资源所有权。
 
+## C++20 的使用边界
+
+主运行时通过 CMake 的 PUBLIC cxx_std_20 要求向调用者传播标准版本；native/ 的 C ABI 桥和 llama.cpp 保持 C++17。C ABI 不暴露 STL 类型，两层无须采用同一标准。
+
+forward 的 batch、采样的 logits、缓存输入与聊天消息使用 std::span<const T>，表示仅在同步调用期间借用连续数据。可传 vector、array 或其中一段，不要求调用者创建临时 vector；调用者必须保证底层数据在调用结束前存活且不被改动。后端不得保存 batch 视图，缓存插入仍复制所需 token，返回的 logits 仍由 vector 拥有。原来的 const vector& 已不复制数据，因此不把接口改动宣称为自动加速。
+
+服务拥有者和退出监控使用 std::jthread/std::stop_token；线程对象通过 RAII 请求停止并等待退出，显式 stop 保证模型拥有者在依赖销毁之前完成清理。停止是协作式的：必须先等同步模型前向返回，不能将 stop_token 当作 GPU 中断。
+
 ## 请求状态：采样完成不等于 KV 已计算
 
 正常路径是 `submit → pending → prefill → decode → finished`。`submit()` 完成校验和分词后入队；只有准入时才占活动 sequence 和 KV 预算。`max_new_tokens=0` 仍校验、分词，但下一步直接返回 `length`，不分配 sequence、不执行模型。
